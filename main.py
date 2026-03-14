@@ -19,11 +19,18 @@ app.add_middleware(
 
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-# This is where to plug in Ayush's format
 class PoseData(BaseModel):
-    back_angle: float
-    knee_angle: float
-    # add more fields here once we know the output format
+    left_ankle: float
+    left_elbow: float
+    left_hip: float
+    left_knee: float
+    left_shoulder: float
+    right_ankle: float
+    right_elbow: float
+    right_hip: float
+    right_knee: float
+    right_shoulder: float
+    spine: float
 
 class EvaluationResponse(BaseModel):
     coaching_tip: str
@@ -35,11 +42,14 @@ class EvaluationResponse(BaseModel):
 @app.post("/evaluate", response_model=EvaluationResponse)
 async def evaluate_pose(pose: PoseData):
     prompt = f"""You are a physical trainer coaching someone on safe lifting form.
-Current joint angles: back angle {pose.back_angle} degrees, knee angle {pose.knee_angle} degrees.
-Good form means: back angle under 30 degrees from vertical, knee angle around 90 degrees when lifting.
-Give exactly one coaching instruction under 10 words if form needs correction.
-If form is good, say 'Good form, keep it up.'
-Also return whether form is good (true/false) and a score 0-100."""
+    Current joint angles:
+    - Spine: {pose.spine} degrees (good form = above 160, means straight back)
+    - Left knee: {pose.left_knee} degrees, Right knee: {pose.right_knee} degrees (good form = below 150 when lifting)
+    - Left hip: {pose.left_hip} degrees, Right hip: {pose.right_hip} degrees
+
+    Give exactly one coaching instruction under 10 words if form needs correction.
+    If form is good, say 'Good form, keep it up.'
+    Do not use any markdown formatting or asterisks in your response."""
 
     message = client.messages.create(
         model="claude-sonnet-4-6",
@@ -48,8 +58,8 @@ Also return whether form is good (true/false) and a score 0-100."""
     )
 
     tip = message.content[0].text
-    is_good = pose.back_angle < 30 and 80 < pose.knee_angle < 110
-    score = 100 if is_good else max(0, 100 - int(abs(pose.back_angle - 20)))
+    is_good = pose.spine > 160 and (pose.left_knee < 150 or pose.right_knee < 150)
+    score = 100 if is_good else min(100, max(0, int(pose.spine - 60)))
 
     return EvaluationResponse(
         coaching_tip=tip,
