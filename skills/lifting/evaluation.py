@@ -1,26 +1,23 @@
 def evaluate(pose) -> tuple[bool, int]:
     """
-    Evaluate lifting form based on joint angles.
-    Returns (is_good_form, score 0-100)
-
-    Good lifting form:
-    - Spine above 160 degrees (straight back)
-    - At least one knee below 150 degrees (bending knees)
-    - Hips above 160 degrees (stable base)
+    Phases:
+    - Standing (both knees > 155): neutral, score 100
+    - Mid-lift (at least one knee < 155): evaluate back and knees
     """
-    spine_good = pose.spine > 160
-    knees_good = pose.left_knee < 150 or pose.right_knee < 150
-    hips_good = pose.left_hip > 160 or pose.right_hip > 160
+    is_standing = pose.left_knee > 155 and pose.right_knee > 155
 
-    is_good = spine_good and knees_good and hips_good
+    if is_standing:
+        # Person is standing upright — good ready position
+        return True, 100
 
-    # Score based on spine angle as primary metric
-    spine_score = min(100, max(0, int(pose.spine - 60)))
+    # Person is in a squat/lift — evaluate form
+    spine_good = pose.spine > 150
+    knees_bending = pose.left_knee < 140 or pose.right_knee < 140
 
-    # Deduct points for bad knees or hips
-    knee_penalty = 0 if knees_good else 20
-    hip_penalty = 0 if hips_good else 10
+    is_good = spine_good and knees_bending
 
-    score = min(100, max(0, spine_score - knee_penalty - hip_penalty))
+    spine_score = min(100, max(0, int((pose.spine - 100) * 1.5)))
+    knee_bonus = 10 if knees_bending else -20
+    score = min(100, max(0, spine_score + knee_bonus))
 
     return is_good, score
