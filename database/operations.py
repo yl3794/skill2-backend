@@ -397,3 +397,53 @@ def get_org_analytics(org_id: str) -> dict:
         "avg_score_across_sessions": round(sessions["avg"], 1) if sessions["avg"] else None,
         "top_workers": [dict(r) for r in top_workers],
     }
+
+
+# ── Programs ───────────────────────────────────────────────────
+
+def create_program(name: str, description: str, skill_ids: list, org_id: str | None = None) -> dict:
+    program = {
+        "id": str(uuid.uuid4()),
+        "org_id": org_id,
+        "name": name,
+        "description": description,
+        "skill_ids": skill_ids,
+        "created_at": now_iso(),
+    }
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO programs (id, org_id, name, description, skill_ids, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (program["id"], org_id, name, description, json.dumps(skill_ids), program["created_at"])
+    )
+    conn.commit()
+    conn.close()
+    return program
+
+
+def get_program(program_id: str) -> dict | None:
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM programs WHERE id = ?", (program_id,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    result = dict(row)
+    result["skill_ids"] = json.loads(result["skill_ids"])
+    return result
+
+
+def list_programs(org_id: str | None = None) -> list[dict]:
+    conn = get_connection()
+    if org_id:
+        rows = conn.execute(
+            "SELECT * FROM programs WHERE org_id IS NULL OR org_id = ? ORDER BY created_at DESC",
+            (org_id,)
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM programs WHERE org_id IS NULL ORDER BY created_at DESC").fetchall()
+    conn.close()
+    results = []
+    for r in rows:
+        d = dict(r)
+        d["skill_ids"] = json.loads(d["skill_ids"])
+        results.append(d)
+    return results

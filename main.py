@@ -1,10 +1,12 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+import io
 from pydantic import BaseModel
 from typing import Optional
 import anthropic
 import os
+import json
 import threading
 import cv2
 import mediapipe as mp
@@ -204,6 +206,10 @@ class StartSessionRequest(BaseModel):
 class WorkerRegisterRequest(BaseModel):
     name: str
     join_code: Optional[str] = None
+
+class CreateProgramFromManualRequest(BaseModel):
+    manual_text: str
+    program_name: Optional[str] = None
 
 
 # ── Shared coaching logic ────────────────────────────────────
@@ -570,3 +576,201 @@ async def worker_certifications(worker_id: str, current_org: dict = Depends(requ
 @app.get("/certifications/{cert_id}/verify")
 async def verify_certification(cert_id: str):
     return db.verify_certification(cert_id)
+
+
+# ── File extraction ────────────────────────────────────────────
+
+@app.post("/programs/extract-text")
+async def extract_text(file: UploadFile = File(...), current_org: dict = Depends(require_org)):
+    content = await file.read()
+    filename = (file.filename or "").lower()
+
+    if filename.endswith(".pdf"):
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(io.BytesIO(content))
+            text = "\n\n".join(page.extract_text() or "" for page in reader.pages)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not read PDF: {str(e)}")
+    elif filename.endswith(".docx"):
+        try:
+            import docx
+            doc = docx.Document(io.BytesIO(content))
+            text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not read DOCX: {str(e)}")
+    else:
+        text = content.decode("utf-8", errors="ignore")
+
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="No readable text found in file")
+
+    return {"text": text, "filename": file.filename, "chars": len(text)}
+
+
+# ── Program routes ─────────────────────────────────────────────
+
+import json as _json
+
+@app.post("/programs/from-manual")
+async def create_program_from_manual(body: CreateProgramFromManualRequest, current_org: dict = Depends(require_org)):
+    JOINTS = ["spine", "left_knee", "right_knee", "left_elbow", "right_elbow",
+              "left_hip", "right_hip", "left_shoulder", "right_shoulder"]
+
+    prompt = f"""You are a physical skills training analyst. Analyze this training manual and extract all physical/posture-related skills that can be monitored using body joint angles.
+
+Available joints for monitoring: {', '.join(JOINTS)}
+Joint values are angles in degrees (0-180).
+
+Training manual content:
+{body.manual_text[:5000]}
+
+Generate a JSON training program. Return ONLY valid JSON, no markdown fences, no explanation:
+{{
+  "program_name": "descriptive name for the training program",
+  "description": "1-2 sentence overview of what this program covers",
+  "skills": [
+    {{
+      "skill_id": "snake_case_id",
+      "display_name": "Human Readable Skill Name",
+      "coaching_context": "describe the physical activity and what good form means for coaching",
+      "form_rules": [
+        {{"joint": "spine", "op": "gt", "value": 150, "violation_tip": "Keep your back straight!"}}
+      ],
+      "score_formula": [
+        {{"joint": "spine", "scale": {{"from": [100, 180], "to": [0, 100]}}, "weight": 1.0}}
+      ],
+      "certification": {{
+        "min_sessions": 3,
+        "min_avg_score": 70,
+        "min_good_form_rate": 0.7,
+        "cert_valid_days": 365
+      }}
+    }}
+  ]
+}}
+
+Rules:
+- Only include skills that involve measurable body posture (lifting, bending, reaching, standing posture, squatting, etc.)
+- Each skill needs at least 1 form_rule
+- Score formula weights must sum to 1.0
+- op must be "gt" (greater than) or "lt" (less than)
+- Spine angle > 150 = straight back; < 120 = hunched
+- Knee angle > 155 = standing straight; < 140 = properly bent
+- Generate 2-5 skills based on what the manual covers
+- If program_name is provided, use it: {body.program_name or "auto-generate a name"}"""
+
+    message = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=3000,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    raw = message.content[0].text.strip()
+    # Strip markdown code fences if present
+    if raw.startswith("```"):
+        parts = raw.split("```")
+        raw = parts[1] if len(parts) > 1 else raw
+        if raw.startswith("json"):
+            raw = raw[4:]
+    raw = raw.strip()
+
+    try:
+        program_def = _json.loads(raw)
+    except _json.JSONDecodeError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to parse program definition: {str(e)}")
+
+    skill_ids = []
+    for skill_def in program_def.get("skills", []):
+        skill_def["skill_id"] = f"{current_org['id']}:{skill_def['skill_id']}"
+        db.upsert_skill(skill_def, org_id=current_org["id"])
+        skill_ids.append(skill_def["skill_id"])
+
+    if not skill_ids:
+        raise HTTPException(status_code=400, detail="No posture skills could be extracted from the manual")
+
+    program = db.create_program(
+        name=program_def.get("program_name", "Training Program"),
+        description=program_def.get("description", ""),
+        skill_ids=skill_ids,
+        org_id=current_org["id"]
+    )
+
+    return {
+        "program": program,
+        "skills_created": len(skill_ids),
+        "program_def": program_def,
+    }
+
+
+@app.get("/programs")
+async def list_programs(current_org: dict = Depends(require_org)):
+    programs = db.list_programs(org_id=current_org["id"])
+    # Enrich with skill display names
+    result = []
+    for p in programs:
+        skills_info = []
+        for sid in p["skill_ids"]:
+            sk = db.get_skill(sid)
+            skills_info.append({
+                "skill_id": sid,
+                "display_name": sk["definition"].get("display_name", sid) if sk else sid,
+            })
+        result.append({**p, "skills_info": skills_info})
+    return result
+
+
+@app.get("/programs/{program_id}")
+async def get_program(program_id: str, current_org: dict = Depends(require_org)):
+    program = db.get_program(program_id)
+    if not program:
+        raise HTTPException(status_code=404, detail="Program not found")
+    if program["org_id"] and program["org_id"] != current_org["id"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return program
+
+
+@app.get("/workers/{worker_id}/progress")
+async def worker_progress(worker_id: str, current_org: dict = Depends(require_org)):
+    worker = db.get_worker(worker_id)
+    if not worker:
+        raise HTTPException(status_code=404, detail="Worker not found")
+    assert_org_owns_worker(worker, current_org)
+
+    programs = db.list_programs(org_id=current_org["id"])
+    result = []
+    for program in programs:
+        skill_progress = []
+        for skill_id in program["skill_ids"]:
+            skill_row = db.get_skill(skill_id)
+            criteria = skill_row["definition"].get("certification", {}) if skill_row else {}
+            history = db.get_worker_skill_history(worker_id, skill_id)
+            cert = db.get_latest_certification(worker_id, skill_id)
+
+            sessions_done = len(history["sessions"])
+            sessions_needed = criteria.get("min_sessions", 3)
+            scores = [s["session"]["avg_score"] for s in history["sessions"] if s["session"]["avg_score"] is not None]
+            avg_score = round(sum(scores) / len(scores), 1) if scores else None
+
+            skill_progress.append({
+                "skill_id": skill_id,
+                "display_name": skill_row["definition"].get("display_name", skill_id) if skill_row else skill_id,
+                "sessions_done": sessions_done,
+                "sessions_needed": sessions_needed,
+                "certified": cert is not None,
+                "avg_score": avg_score,
+            })
+
+        completed = sum(1 for s in skill_progress if s["certified"])
+        total = len(program["skill_ids"])
+        result.append({
+            "program_id": program["id"],
+            "program_name": program["name"],
+            "description": program.get("description", ""),
+            "skill_progress": skill_progress,
+            "completed_skills": completed,
+            "total_skills": total,
+            "completion_pct": round(completed / total * 100) if total else 0,
+        })
+
+    return result

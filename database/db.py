@@ -72,6 +72,15 @@ def init_db():
             expires_at      TEXT NOT NULL,
             token           TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS programs (
+            id          TEXT PRIMARY KEY,
+            org_id      TEXT,
+            name        TEXT NOT NULL,
+            description TEXT,
+            skill_ids   TEXT NOT NULL,
+            created_at  TEXT NOT NULL
+        );
     """)
 
     conn.commit()
