@@ -14,6 +14,7 @@ def evaluate(pose) -> tuple[bool, int]:
     spine_good = pose.spine > 150
     knees_bending = pose.left_knee < 140 or pose.right_knee < 140
 
+
     is_good = spine_good and knees_bending
 
     spine_score = min(100, max(0, int((pose.spine - 100) * 1.5)))
