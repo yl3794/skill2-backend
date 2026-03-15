@@ -97,23 +97,67 @@ def get_workers_by_org(org_id: str) -> list[dict]:
 # ── Sessions ──────────────────────────────────────────────────
 
 def create_session(worker_id: str, skill_id: str) -> dict:
+    """Creates a new training session in PENDING state.
+
+    Args:
+        worker_id: UUID of the worker starting the session.
+        skill_id: Identifier of the skill to be trained.
+
+    Returns:
+        Session dict with ``state: PENDING`` and all audit fields.
+    """
     session = {
-        "id": str(uuid.uuid4()),
-        "worker_id": worker_id,
-        "skill_id": skill_id,
+        "id":         str(uuid.uuid4()),
+        "worker_id":  worker_id,
+        "skill_id":   skill_id,
+        "state":      "PENDING",
         "started_at": now_iso(),
-        "ended_at": None,
-        "avg_score": None,
-        "rep_count": 0,
+        "ended_at":   None,
+        "avg_score":  None,
+        "rep_count":  0,
     }
     conn = get_connection()
     conn.execute(
-        "INSERT INTO sessions (id, worker_id, skill_id, started_at) VALUES (?, ?, ?, ?)",
-        (session["id"], session["worker_id"], session["skill_id"], session["started_at"])
+        "INSERT INTO sessions (id, worker_id, skill_id, state, started_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (session["id"], session["worker_id"], session["skill_id"],
+         session["state"], session["started_at"]),
     )
     conn.commit()
     conn.close()
     return session
+
+
+def update_session_state(session_id: str, new_state: str) -> None:
+    """Persists a validated FSM state transition to the sessions table.
+
+    Also appends a timestamped entry to the ``state_history`` JSON array
+    for the audit trail.
+
+    Args:
+        session_id: UUID of the session to update.
+        new_state: The target state (already validated by SessionFSM).
+    """
+    conn = get_connection()
+    row  = conn.execute(
+        "SELECT state_history FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+
+    history: list = []
+    if row and row["state_history"]:
+        try:
+            history = json.loads(row["state_history"])
+        except (json.JSONDecodeError, TypeError):
+            history = []
+
+    history.append({"state": new_state, "at": now_iso()})
+
+    conn.execute(
+        "UPDATE sessions SET state = ?, state_history = ? WHERE id = ?",
+        (new_state, json.dumps(history), session_id),
+    )
+    conn.commit()
+    conn.close()
 
 
 def end_session(session_id: str) -> dict | None:
@@ -163,24 +207,75 @@ def get_sessions_by_worker(worker_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def list_worker_sessions(worker_id: str, skill_id: str) -> list[dict]:
+    """Returns all completed sessions for a worker on a specific skill.
+
+    Used by the coaching engine to determine how experienced the worker is
+    with this skill, so coaching tips can be calibrated accordingly.
+
+    Args:
+        worker_id: UUID of the worker.
+        skill_id: Skill identifier to filter by.
+
+    Returns:
+        List of completed session dicts, oldest first.
+    """
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM sessions WHERE worker_id = ? AND skill_id = ? AND state = 'COMPLETED' ORDER BY started_at ASC",
+        (worker_id, skill_id)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 # ── Reps ──────────────────────────────────────────────────────
 
-def record_rep(session_id: str, score: int, is_good_form: bool, angles: dict, coaching_tip: str) -> dict:
+def record_rep(
+    session_id:      str,
+    score:           int,
+    is_good_form:    bool,
+    angles:          dict,
+    coaching_tip:    str,
+    compliance_json: str | None = None,
+    confidence:      float | None = None,
+) -> dict:
+    """Records a single evaluated rep to the audit log.
+
+    Args:
+        session_id: UUID of the parent training session.
+        score: Integer 0–100 from the skill score_formula.
+        is_good_form: True when no form_rule violations were detected.
+        angles: Dict of joint name → angle in degrees.
+        coaching_tip: Claude-generated coaching sentence for this rep.
+        compliance_json: Optional serialized ComplianceMetadata blob.
+            When provided, enables full post-hoc audit reconstruction.
+        confidence: Mean landmark visibility score [0.0–1.0].
+            Stored as a separate indexed column for fast certification queries.
+
+    Returns:
+        The created rep dict.
+    """
     rep = {
-        "id": str(uuid.uuid4()),
-        "session_id": session_id,
-        "score": score,
-        "is_good_form": int(is_good_form),
-        "angles_json": json.dumps(angles),
-        "coaching_tip": coaching_tip,
-        "created_at": now_iso(),
+        "id":              str(uuid.uuid4()),
+        "session_id":      session_id,
+        "score":           score,
+        "is_good_form":    int(is_good_form),
+        "angles_json":     json.dumps(angles),
+        "coaching_tip":    coaching_tip,
+        "compliance_json": compliance_json,
+        "confidence":      confidence,
+        "created_at":      now_iso(),
     }
     conn = get_connection()
     conn.execute(
-        "INSERT INTO reps (id, session_id, score, is_good_form, angles_json, coaching_tip, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO reps "
+        "(id, session_id, score, is_good_form, angles_json, coaching_tip, "
+        " compliance_json, confidence, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (rep["id"], rep["session_id"], rep["score"], rep["is_good_form"],
-         rep["angles_json"], rep["coaching_tip"], rep["created_at"])
+         rep["angles_json"], rep["coaching_tip"],
+         rep["compliance_json"], rep["confidence"], rep["created_at"]),
     )
     conn.commit()
     conn.close()

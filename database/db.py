@@ -89,21 +89,39 @@ def init_db():
 
 
 def _migrate(conn):
+    """Applies additive schema migrations idempotently.
+
+    Each migration is attempted individually; SQLite raises an error if the
+    column already exists, which is silently swallowed. This makes the
+    migration list append-only and safe to re-run on every startup.
+
+    Args:
+        conn: An open SQLite connection (must have WAL mode already set).
+    """
     migrations = [
-        "ALTER TABLE orgs ADD COLUMN join_code TEXT",
-        "ALTER TABLE sessions ADD COLUMN debrief TEXT",
+        # Historic migrations
+        "ALTER TABLE orgs     ADD COLUMN join_code      TEXT",
+        "ALTER TABLE sessions ADD COLUMN debrief        TEXT",
+        # FSM state tracking (v2)
+        "ALTER TABLE sessions ADD COLUMN state          TEXT DEFAULT 'ACTIVE'",
+        "ALTER TABLE sessions ADD COLUMN state_history  TEXT",
+        # Compliance audit blob (v2)
+        "ALTER TABLE reps     ADD COLUMN compliance_json TEXT",
+        "ALTER TABLE reps     ADD COLUMN confidence      REAL",
     ]
     for sql in migrations:
         try:
             conn.execute(sql)
             conn.commit()
         except Exception:
-            pass  # column already exists
+            pass  # column already exists — safe to ignore
 
-    # Backfill join codes for orgs that don't have one
+    # Backfill join codes for orgs that pre-date the join_code column.
     rows = conn.execute("SELECT id FROM orgs WHERE join_code IS NULL").fetchall()
     for row in rows:
-        conn.execute("UPDATE orgs SET join_code = ? WHERE id = ?",
-                     (secrets.token_hex(3).upper(), row["id"]))
+        conn.execute(
+            "UPDATE orgs SET join_code = ? WHERE id = ?",
+            (secrets.token_hex(3).upper(), row["id"]),
+        )
     if rows:
         conn.commit()

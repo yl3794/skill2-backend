@@ -82,26 +82,147 @@ def evaluate_skill(definition: dict, pose: dict) -> tuple[bool, int, list[dict]]
     return is_good, score, violations
 
 
-def build_coaching_prompt(definition: dict, pose: dict, violations: list[dict]) -> str:
-    display_name = definition.get("display_name", "this skill")
-    context = definition.get("coaching_context", f"coaching someone on {display_name}")
+def build_coaching_prompt(
+    definition:     dict,
+    pose:           dict,
+    violations:     list[dict],
+    rep_history:    list[dict] | None = None,
+    worker_name:    str | None = None,
+    session_number: int = 1,
+) -> str:
+    """Builds a context-rich coaching prompt for Claude.
 
-    phase = _detect_phase(definition, pose)
-    if phase and "coaching_instruction" in phase:
-        phase_block = f"Situation: {phase['coaching_instruction']}"
-    elif violations:
-        tips = "\n".join(f"- {v['violation_tip']}" for v in violations if "violation_tip" in v)
-        phase_block = f"Issues detected:\n{tips}\nGive one short, direct coaching cue for the most critical issue."
+    Instead of passing raw angle numbers, this prompt gives Claude a physical
+    interpretation of what went wrong, a summary of the worker's recent rep
+    history, and any persistent patterns — so it can reason like a real coach
+    rather than a threshold-checker.
+
+    Args:
+        definition: Skill definition dict with form_rules, coaching_context, etc.
+        pose: Current rep joint angles (degrees).
+        violations: Form rules that failed this rep.
+        rep_history: Last N reps from the session (score, is_good_form, coaching_tip).
+        worker_name: Worker's name for personalisation.
+        session_number: How many sessions this worker has done for this skill.
+
+    Returns:
+        Prompt string ready to send to Claude.
+    """
+    display_name  = definition.get("display_name", "this skill")
+    context       = definition.get("coaching_context", "")
+    form_rules    = definition.get("form_rules", [])
+    rep_history   = rep_history or []
+    name          = worker_name or "the worker"
+    rep_num       = len(rep_history) + 1  # this rep will be rep N
+
+    # ── Physical violation descriptions ──────────────────────────────────────
+    # Translate angle + threshold into a human-readable physical description.
+    _joint_labels = {
+        "spine":          "back/spine",
+        "left_knee":      "left knee",
+        "right_knee":     "right knee",
+        "left_hip":       "left hip",
+        "right_hip":      "right hip",
+        "left_shoulder":  "left shoulder",
+        "right_shoulder": "right shoulder",
+        "left_elbow":     "left elbow",
+        "right_elbow":    "right elbow",
+    }
+    _op_phrases = {
+        "gt":  ("should be above", "was below"),
+        "gte": ("should be at least", "was below"),
+        "lt":  ("should be below", "was above"),
+        "lte": ("should be at most", "was above"),
+    }
+
+    # Severity: how far off is the joint from the threshold?
+    def _severity(v):
+        actual    = pose.get(v.get("joint"), 0)
+        threshold = v.get("value", 0)
+        diff      = abs(actual - threshold)
+        if diff >= 20: return "significantly"
+        if diff >= 10: return "noticeably"
+        return "slightly"
+
+    if violations:
+        violation_lines = []
+        for v in violations:
+            tip      = v.get("violation_tip", "")
+            severity = _severity(v)
+            violation_lines.append(f"- {tip} ({severity} off)")
+        this_rep_block = "FORM ISSUES THIS REP:\n" + "\n".join(violation_lines)
+        this_rep_form  = "needs work"
     else:
-        phase_block = "Form looks good. Give brief positive reinforcement in one sentence."
+        this_rep_block = "FORM THIS REP: Good — no violations detected."
+        this_rep_form  = "good"
 
-    angles_str = "\n".join(f"- {k}: {v}°" for k, v in pose.items())
+    # ── Session history summary ───────────────────────────────────────────────
+    if rep_history:
+        scores       = [r["score"] for r in rep_history]
+        good_count   = sum(1 for r in rep_history if r.get("is_good_form"))
+        avg          = sum(scores) / len(scores)
+        recent5      = scores[-5:]
 
-    return f"""You are a coach {context}.
+        # Score trend over last 5 reps
+        if len(recent5) >= 3:
+            if recent5[-1] > recent5[0] + 8:
+                trend = "improving"
+            elif recent5[-1] < recent5[0] - 8:
+                trend = "declining"
+            else:
+                trend = "consistent"
+        else:
+            trend = "not enough data"
 
-Current joint angles:
-{angles_str}
+        scores_str = ", ".join(str(s) for s in scores[-5:])
+        history_block = (
+            f"SESSION HISTORY (last {len(rep_history)} reps):\n"
+            f"- Scores: {scores_str} → current rep is #{rep_num}\n"
+            f"- Good form rate: {good_count}/{len(rep_history)} reps\n"
+            f"- Trend: {trend}"
+        )
 
-{phase_block}
+        # Detect persistent issues across last 5 reps
+        recent_tips = [r.get("coaching_tip", "") for r in rep_history[-5:] if not r.get("is_good_form")]
+        persistent_block = ""
+        if len(recent_tips) >= 3:
+            persistent_block = (
+                f"\nPERSISTENT ISSUE: {name} has had form problems in "
+                f"{len(recent_tips)} of the last {min(5, len(rep_history))} reps. "
+                "This is a recurring pattern, not a one-off mistake."
+            )
+    else:
+        history_block    = f"SESSION HISTORY: This is {name}'s first rep of this session."
+        persistent_block = ""
 
-Respond in one sentence. No markdown, no asterisks."""
+    # ── Session experience level ──────────────────────────────────────────────
+    if session_number <= 1:
+        experience = f"This is {name}'s first session on this skill."
+    elif session_number <= 3:
+        experience = f"This is session {session_number} for {name} on this skill — still learning."
+    else:
+        experience = f"{name} has completed {session_number - 1} previous sessions on this skill."
+
+    # ── Form requirements (what good looks like) ─────────────────────────────
+    rules_str = "\n".join(
+        f"- {r.get('violation_tip', '')}" for r in form_rules if r.get("violation_tip")
+    ) or "Follow the technique described above."
+
+    return f"""You are a physical skills coach. You are training {name} on: {display_name}.
+
+ABOUT THIS SKILL:
+{context or f'Proper technique for {display_name}.'}
+
+WHAT GOOD FORM REQUIRES:
+{rules_str}
+
+{experience}
+
+{history_block}{persistent_block}
+
+THIS REP (form: {this_rep_form}):
+{this_rep_block}
+
+Give a 1–2 sentence coaching response. Use directional, physical language ("round your back less", "bend your knees deeper", "keep the load closer") — never mention degrees, numbers, or measurements. If there is a persistent pattern, address it directly. If they are improving, acknowledge it. Sound like a real coach talking to someone mid-workout.
+
+No markdown, no asterisks, no degree symbols, no numbers, no filler phrases like "Great job!" unless they truly earned it."""
